@@ -88,7 +88,7 @@ sudo apt-get install \
 
 ```bash
 git clone https://github.com/ariel10aguero/midi-clock-jack-bridge
-cd midi-clock-jack-sync
+cd midi-clock-jack-bridge
 ```
 
 ### 2. Build
