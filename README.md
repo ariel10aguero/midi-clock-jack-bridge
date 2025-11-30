@@ -12,7 +12,7 @@ The tool was specifically created to work seamlessly with Carla as a primary use
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                    🎹 EXTERNAL CLOCK SOURCE                      │
+│                    🎹 EXTERNAL CLOCK SOURCE                     │
 │               MIDI Clock Source (HW/DAW)                        │
 │               • Sends F8 (clock ticks at 24 PPQN)               │
 │               • Optional: FA/FB/FC transport messages           │
@@ -20,7 +20,7 @@ The tool was specifically created to work seamlessly with Carla as a primary use
                              │ MIDI Protocol (ALSA)
                              ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                🔄 MIDI CLOCK SYNC PROGRAM                        │
+│                🔄 MIDI CLOCK SYNC PROGRAM                       │
 │                     ** BPM TRANSLATOR **                        │
 ├─────────────────────────────────────────────────────────────────┤
 │  ✓ Opens ALSA MIDI input port                                   │
@@ -33,7 +33,7 @@ The tool was specifically created to work seamlessly with Carla as a primary use
                              │ Writes BPM to JACK Transport
                              ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                   🎚️  JACK / PIPEWIRE ENGINE                     │
+│                   🎚️  JACK / PIPEWIRE ENGINE                    │
 │  • Current BPM ← continuously updated                           │
 │  • BBT time information                                         │
 │  • Transport state (rolling/stopped)                            │
@@ -41,7 +41,7 @@ The tool was specifically created to work seamlessly with Carla as a primary use
                              │ All clients read shared BPM
                              ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                        🎛️  CARLA / ARDOUR                        │
+│                        🎛️  CARLA / ARDOUR                       │
 │  • Registers as JACK client                                     │
 │  • Reads current BPM from JACK transport                        │
 │  • Plugins stay in sync with external MIDI clock                │
