@@ -87,7 +87,7 @@ sudo apt-get install \
 ### 1. Clone Repo
 
 ```bash
-git clone https://github.com/yourusername/midi-clock-jack-sync.git
+git clone https://github.com/ariel10aguero/midi-clock-jack-bridge
 cd midi-clock-jack-sync
 ```
 
