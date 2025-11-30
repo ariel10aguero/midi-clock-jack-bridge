@@ -10,6 +10,8 @@
 #include <cmath>
 #include <thread>
 #include <unistd.h>
+#include <termios.h>
+#include <fcntl.h>
 
 // ============================================================================
 // CONFIGURATION
@@ -45,7 +47,7 @@ struct BPMState {
     // Bar/beat tracking
     std::atomic<int> bar{1};
     std::atomic<int> beat{1};
-    std::atomic<int> tick{0};  // Track ticks within beat (0-1919)
+    std::atomic<int> tick{0};
     
     // Frame tracking for JACK transport
     std::atomic<jack_nframes_t> current_frame{0};
@@ -58,13 +60,81 @@ struct BPMState {
 
 BPMState g_bpm_state;
 
+// Terminal settings backup
+struct termios g_orig_termios;
+
 // ============================================================================
-// JACK PROCESS CALLBACK - Updates frame position in real-time
+// FORWARD DECLARATIONS
+// ============================================================================
+void display_status();
+
+// ============================================================================
+// TERMINAL SETUP FOR NON-BLOCKING INPUT
+// ============================================================================
+void setup_terminal() {
+    // Save original terminal settings
+    tcgetattr(STDIN_FILENO, &g_orig_termios);
+    
+    struct termios term = g_orig_termios;
+    term.c_lflag &= ~(ICANON | ECHO); // Disable canonical mode and echo
+    term.c_cc[VMIN] = 0;  // Non-blocking read
+    term.c_cc[VTIME] = 0;
+    tcsetattr(STDIN_FILENO, TCSANOW, &term);
+    
+    // Set stdin to non-blocking
+    int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+    fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
+}
+
+void restore_terminal() {
+    tcsetattr(STDIN_FILENO, TCSANOW, &g_orig_termios);
+    
+    int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+    fcntl(STDIN_FILENO, F_SETFL, flags & ~O_NONBLOCK);
+}
+
+// ============================================================================
+// TRANSPORT RESET FUNCTION
+// ============================================================================
+void reset_transport() {
+    std::cout << "\n[CMD] ⏮ Resetting transport to beginning..." << std::endl;
+    
+    if (g_jack_client) {
+        // Stop transport first
+        jack_transport_stop(g_jack_client);
+        g_bpm_state.transport_rolling.store(false);
+        
+        // Reset frame counter
+        g_bpm_state.current_frame.store(0);
+        
+        // Reset BBT position
+        g_bpm_state.bar.store(1);
+        g_bpm_state.beat.store(1);
+        g_bpm_state.tick.store(0);
+        
+        // Relocate JACK transport to frame 0
+        jack_position_t pos;
+        pos.frame = 0;
+        pos.valid = (jack_position_bits_t)0;
+        jack_transport_reposition(g_jack_client, &pos);
+        
+        std::cout << "[CMD] ✓ Transport position: 0:0:0, frame: 0" << std::endl;
+    }
+    
+    // Reset measurement tracking
+    g_bpm_state.pulse_count.store(0);
+    g_bpm_state.measurement_count.store(0);
+    g_bpm_state.first_clock_received.store(false);
+    
+    std::cout << "[CMD] ✓ Reset complete" << std::endl;
+}
+
+// ============================================================================
+// JACK PROCESS CALLBACK
 // ============================================================================
 int jack_process_callback(jack_nframes_t nframes, void* arg) {
     (void)arg;
     
-    // Update frame counter if transport is rolling
     if (g_bpm_state.transport_rolling.load()) {
         jack_nframes_t current = g_bpm_state.current_frame.load();
         g_bpm_state.current_frame.store(current + nframes);
@@ -74,13 +144,10 @@ int jack_process_callback(jack_nframes_t nframes, void* arg) {
 }
 
 // ============================================================================
-// JACK TIMEBASE CALLBACK - Provides BBT info based on current position
+// JACK TIMEBASE CALLBACK
 // ============================================================================
-void jack_timebase_callback(jack_transport_state_t state,
-                            jack_nframes_t nframes,
-                            jack_position_t *pos,
-                            int new_pos,
-                            void *arg) {
+void jack_timebase_callback(jack_transport_state_t state, jack_nframes_t nframes,
+                            jack_position_t *pos, int new_pos, void *arg) {
     (void)state;
     (void)nframes;
     (void)arg;
@@ -88,48 +155,33 @@ void jack_timebase_callback(jack_transport_state_t state,
     double bpm = g_bpm_state.current_bpm.load();
     jack_nframes_t sample_rate = g_bpm_state.sample_rate;
     
-    // On position change (seek, start, etc), reset to our tracked position
     if (new_pos) {
         pos->frame = g_bpm_state.current_frame.load();
     } else {
-        // Normal operation: use JACK's frame counter
         g_bpm_state.current_frame.store(pos->frame);
     }
     
-    // Calculate BBT position from frame position
     pos->valid = JackPositionBBT;
     pos->beats_per_bar = 4.0;
     pos->beat_type = 4.0;
     pos->ticks_per_beat = 1920.0;
     pos->beats_per_minute = bpm;
     
-    // Calculate elapsed time in seconds
     double seconds_elapsed = (double)pos->frame / (double)sample_rate;
-    
-    // Calculate total beats elapsed
     double beats_elapsed = (bpm / 60.0) * seconds_elapsed;
-    
-    // Calculate bar, beat, tick from beats_elapsed
     double beats_per_bar = pos->beats_per_bar;
     double total_bars = beats_elapsed / beats_per_bar;
     
-    pos->bar = (int32_t)(total_bars) + 1;  // Bars start at 1
+    pos->bar = (int32_t)(total_bars) + 1;
     
     double beat_in_bar = fmod(beats_elapsed, beats_per_bar);
-    pos->beat = (int32_t)(beat_in_bar) + 1;  // Beats start at 1
+    pos->beat = (int32_t)(beat_in_bar) + 1;
     
     double tick_in_beat = fmod(beat_in_bar, 1.0) * pos->ticks_per_beat;
     pos->tick = (int32_t)(tick_in_beat);
     
-    // Calculate bar start tick
     pos->bar_start_tick = (pos->bar - 1) * beats_per_bar * pos->ticks_per_beat;
     
-    // Calculate ticks per second for proper BBT time tracking
-    double beats_per_second = bpm / 60.0;
-    double ticks_per_second = beats_per_second * pos->ticks_per_beat;
-    pos->ticks_per_beat = pos->ticks_per_beat;
-    
-    // Also store in our state for display
     g_bpm_state.bar.store(pos->bar);
     g_bpm_state.beat.store(pos->beat);
     g_bpm_state.tick.store(pos->tick);
@@ -144,43 +196,130 @@ void signal_handler(int) {
 }
 
 void display_status() {
-    std::cout << "\nââ€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â" << std::endl;
-    std::cout << "â     MIDI Clock Sync Status             â" << std::endl;
-    std::cout << "ââ€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â" << std::endl;
+    std::cout << "\n┌────────────────────────────────────────┐" << std::endl;
+    std::cout << "│ MIDI Clock Sync Status                 │" << std::endl;
+    std::cout << "├────────────────────────────────────────┤" << std::endl;
     
     if (g_jack_client) {
         jack_position_t pos;
         jack_transport_state_t state = jack_transport_query(g_jack_client, &pos);
         
-        std::cout << "Transport State: ";
+        std::cout << "│ Transport State: ";
         switch(state) {
-            case JackTransportStopped:  std::cout << "â¹  STOPPED" << std::endl; break;
-            case JackTransportRolling:  std::cout << "â¶  PLAYING" << std::endl; break;
-            case JackTransportStarting: std::cout << "â¯  STARTING" << std::endl; break;
-            default: std::cout << "? UNKNOWN" << std::endl;
+            case JackTransportStopped:
+                std::cout << "⏹ STOPPED              │" << std::endl;
+                break;
+            case JackTransportRolling:
+                std::cout << "▶ PLAYING              │" << std::endl;
+                break;
+            case JackTransportStarting:
+                std::cout << "⏯ STARTING             │" << std::endl;
+                break;
+            default:
+                std::cout << "? UNKNOWN              │" << std::endl;
         }
         
         if (pos.valid & JackPositionBBT) {
-            std::cout << "JACK BPM:        " << std::fixed << std::setprecision(2) 
-                      << pos.beats_per_minute << std::endl;
-            std::cout << "Position:        Bar " << pos.bar << ", Beat " << pos.beat 
-                      << ", Tick " << pos.tick << std::endl;
-            std::cout << "Frame:           " << pos.frame << std::endl;
-            std::cout << "Time Signature:  " << pos.beats_per_bar << "/" << pos.beat_type << std::endl;
-        } else {
-            std::cout << "BBT Info:        Not available" << std::endl;
+            std::cout << "│ JACK BPM: " << std::fixed << std::setprecision(2) 
+                      << std::setw(28) << std::left << pos.beats_per_minute << "│" << std::endl;
+            
+            std::ostringstream oss;
+            oss << "Bar " << pos.bar << ", Beat " << pos.beat << ", Tick " << pos.tick;
+            std::cout << "│ Position: " << std::setw(29) << std::left << oss.str() << "│" << std::endl;
+            std::cout << "│ Frame: " << std::setw(32) << std::left << pos.frame << "│" << std::endl;
         }
     }
     
-    std::cout << "Detected BPM:    " << g_bpm_state.current_bpm.load() << std::endl;
-    std::cout << "Measurements:    " << g_bpm_state.measurement_count.load() << std::endl;
-    std::cout << "Current Pos:     " << g_bpm_state.bar.load() << ":" 
-              << g_bpm_state.beat.load() << ":" << g_bpm_state.tick.load() << std::endl;
-    std::cout << "â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€â€\n" << std::endl;
+    std::cout << "│ Detected BPM: " << std::fixed << std::setprecision(2) 
+              << std::setw(25) << std::left << g_bpm_state.current_bpm.load() << "│" << std::endl;
+    std::cout << "│ Measurements: " << std::setw(25) << std::left 
+              << g_bpm_state.measurement_count.load() << "│" << std::endl;
+    
+    std::ostringstream pos_oss;
+    pos_oss << g_bpm_state.bar.load() << ":" << g_bpm_state.beat.load() 
+            << ":" << g_bpm_state.tick.load();
+    std::cout << "│ Current Pos: " << std::setw(26) << std::left << pos_oss.str() << "│" << std::endl;
+    std::cout << "└────────────────────────────────────────┘\n" << std::endl;
 }
 
 void status_signal_handler(int) {
     display_status();
+}
+
+void reset_signal_handler(int) {
+    reset_transport();
+    display_status();
+}
+
+// ============================================================================
+// KEYBOARD COMMAND THREAD - Single keypress, no Enter needed
+// ============================================================================
+void command_thread_func() {
+    char c;
+    
+    while (g_running) {
+        ssize_t n = read(STDIN_FILENO, &c, 1);
+        if (n > 0) {
+            switch(c) {
+                case 'r':
+                case 'R':
+                    reset_transport();
+                    break;
+                    
+                case 's':
+                case 'S':
+                    display_status();
+                    break;
+                    
+                case 'p':
+                case 'P':
+                case ' ':  // Space bar also toggles
+                    if (g_jack_client) {
+                        jack_position_t pos;
+                        jack_transport_state_t state = jack_transport_query(g_jack_client, &pos);
+                        
+                        if (state == JackTransportRolling) {
+                            jack_transport_stop(g_jack_client);
+                            g_bpm_state.transport_rolling.store(false);
+                            std::cout << "\n[CMD] ⏹ Transport stopped" << std::endl;
+                        } else {
+                            jack_transport_start(g_jack_client);
+                            g_bpm_state.transport_rolling.store(true);
+                            std::cout << "\n[CMD] ▶ Transport started" << std::endl;
+                        }
+                    }
+                    break;
+                    
+                case 'h':
+                case 'H':
+                case '?':
+                    std::cout << "\n╔════════════════════════════════════════╗" << std::endl;
+                    std::cout << "║ Keyboard Commands (no Enter needed)   ║" << std::endl;
+                    std::cout << "╠════════════════════════════════════════╣" << std::endl;
+                    std::cout << "║ R         - Reset to beginning         ║" << std::endl;
+                    std::cout << "║ S         - Show status                ║" << std::endl;
+                    std::cout << "║ P or SPACE - Play/Pause toggle         ║" << std::endl;
+                    std::cout << "║ H or ?    - Show this help             ║" << std::endl;
+                    std::cout << "║ Q         - Quit                       ║" << std::endl;
+                    std::cout << "║ Ctrl+C    - Exit                       ║" << std::endl;
+                    std::cout << "╚════════════════════════════════════════╝\n" << std::endl;
+                    break;
+                    
+                case 'q':
+                case 'Q':
+                case 3:  // Ctrl+C
+                    std::cout << "\n[CMD] Exiting..." << std::endl;
+                    g_running = false;
+                    break;
+                    
+                default:
+                    // Ignore other keys silently
+                    break;
+            }
+        }
+        
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
 }
 
 // ============================================================================
@@ -216,15 +355,12 @@ void update_jack_transport_bpm(double bpm) {
     
     double last_bpm = g_bpm_state.last_updated_jack_bpm.load();
     
-    // Log significant changes
     if (std::abs(bpm - last_bpm) > 0.3) {
         g_bpm_state.last_updated_jack_bpm.store(bpm);
         std::cout << "[JACK] Transport BPM updated to: " << std::fixed 
                   << std::setprecision(2) << bpm << std::endl;
     }
     
-    // Force timebase callback to run by relocating to current position
-    // This ensures Carla and other apps see the update immediately
     jack_position_t pos;
     jack_transport_query(g_jack_client, &pos);
     jack_transport_reposition(g_jack_client, &pos);
@@ -235,17 +371,14 @@ void update_jack_transport_bpm(double bpm) {
 // ============================================================================
 void calculate_and_set_bpm() {
     auto now = std::chrono::high_resolution_clock::now();
-    
     int count = g_bpm_state.pulse_count.load();
     
-    // Initialize timing on first clock
     if (!g_bpm_state.first_clock_received.load()) {
         g_bpm_state.first_clock_received.store(true);
         g_bpm_state.last_pulse_time = now;
         g_bpm_state.pulse_count.store(0);
         g_bpm_state.transport_start_time = now;
         
-        // Auto-start transport on first clock
         if (g_jack_client && !g_bpm_state.transport_rolling.load()) {
             jack_transport_start(g_jack_client);
             g_bpm_state.transport_rolling.store(true);
@@ -256,7 +389,6 @@ void calculate_and_set_bpm() {
     
     count++;
     
-    // Calculate BPM after 24 pulses (one quarter note)
     if (count >= PULSES_PER_QUARTER) {
         auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
             now - g_bpm_state.last_pulse_time).count();
@@ -269,39 +401,29 @@ void calculate_and_set_bpm() {
             double smoothed_bpm;
             int mcount = g_bpm_state.measurement_count.load();
             
-            // Adaptive smoothing: fast convergence initially or on large changes
             if (mcount < 5 || std::abs(raw_bpm - current) > 10.0) {
-                // Fast convergence (90% new value)
                 smoothed_bpm = current * 0.1 + raw_bpm * 0.9;
             } else if (mcount < 10 || std::abs(raw_bpm - current) > 3.0) {
-                // Medium convergence (50% new value)
                 smoothed_bpm = current * 0.5 + raw_bpm * 0.5;
             } else {
-                // Normal smoothing
                 smoothed_bpm = current * (1.0 - SMOOTHING_FACTOR) + raw_bpm * SMOOTHING_FACTOR;
             }
             
             double final_bpm = snap_bpm(raw_bpm, smoothed_bpm);
-            
             g_bpm_state.current_bpm.store(final_bpm);
             g_bpm_state.measurement_count++;
             
-            // Update JACK transport
             update_jack_transport_bpm(final_bpm);
             
-            // Display
             std::string snap_indicator = (final_bpm == std::round(final_bpm)) ? " [LOCKED]" : "";
-            
             std::cout << "[MIDI] " << g_bpm_state.bar << ":" << g_bpm_state.beat 
-                      << " | BPM: " << std::fixed << std::setprecision(2) 
-                      << final_bpm << " (raw: " << raw_bpm << ")" 
-                      << snap_indicator << std::endl;
+                      << " | BPM: " << std::fixed << std::setprecision(2) << final_bpm 
+                      << " (raw: " << raw_bpm << ")" << snap_indicator << std::endl;
         }
         
         g_bpm_state.pulse_count.store(0);
         g_bpm_state.last_pulse_time = now;
         
-        // Status display every 16 beats
         if (g_bpm_state.measurement_count % 16 == 0) {
             display_status();
         }
@@ -324,19 +446,16 @@ void process_midi_clock(snd_seq_event_t* ev) {
         case SND_SEQ_EVENT_START:
             std::cout << "[MIDI] START received" << std::endl;
             if (g_jack_client) {
-                // Reset to beginning
                 g_bpm_state.current_frame.store(0);
                 g_bpm_state.bar.store(1);
                 g_bpm_state.beat.store(1);
                 g_bpm_state.tick.store(0);
                 
-                // Relocate transport to frame 0
                 jack_position_t pos;
                 pos.frame = 0;
                 pos.valid = (jack_position_bits_t)0;
                 jack_transport_reposition(g_jack_client, &pos);
                 
-                // Start transport
                 jack_transport_start(g_jack_client);
                 g_bpm_state.transport_rolling.store(true);
             }
@@ -376,9 +495,10 @@ int main(int argc, char* argv[]) {
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
     signal(SIGUSR1, status_signal_handler);
+    signal(SIGUSR2, reset_signal_handler);
     
     std::cout << "\n========================================" << std::endl;
-    std::cout << "  MIDI Clock -> JACK Transport Sync  " << std::endl;
+    std::cout << " MIDI Clock -> JACK Transport Sync " << std::endl;
     std::cout << "========================================\n" << std::endl;
     
     // ========================================================================
@@ -404,7 +524,6 @@ int main(int argc, char* argv[]) {
     int client_id = snd_seq_client_id(g_seq_handle);
     std::cout << "[ALSA] MIDI port created: " << client_id << ":" << port << std::endl;
     
-    // Auto-connect to source if specified
     if (argc > 1) {
         snd_seq_addr_t sender, dest;
         if (snd_seq_parse_address(g_seq_handle, &sender, argv[1]) == 0) {
@@ -421,8 +540,8 @@ int main(int argc, char* argv[]) {
         }
     } else {
         std::cout << "[INFO] Usage: " << argv[0] << " <midi_port>" << std::endl;
-        std::cout << "       Example: " << argv[0] << " 32:0" << std::endl;
-        std::cout << "       Use 'aconnect -l' to list available ports" << std::endl;
+        std::cout << "  Example: " << argv[0] << " 32:0" << std::endl;
+        std::cout << "  Use 'aconnect -l' to list available ports" << std::endl;
     }
     
     // ========================================================================
@@ -435,19 +554,15 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     
-    // Get sample rate
     g_bpm_state.sample_rate = jack_get_sample_rate(g_jack_client);
     std::cout << "[JACK] Sample rate: " << g_bpm_state.sample_rate << " Hz" << std::endl;
     
-    // Register process callback for frame tracking
     jack_set_process_callback(g_jack_client, jack_process_callback, nullptr);
     
-    // Register as timebase master with conditional takeover
     if (jack_set_timebase_callback(g_jack_client, 1, jack_timebase_callback, nullptr) == 0) {
         std::cout << "[JACK] Registered as timebase master" << std::endl;
     } else {
-        std::cerr << "[WARN] Could not become timebase master (another master exists)" << std::endl;
-        std::cerr << "[INFO] Will still track BPM but won't control JACK transport BBT" << std::endl;
+        std::cerr << "[WARN] Could not become timebase master" << std::endl;
     }
     
     if (jack_activate(g_jack_client) != 0) {
@@ -460,14 +575,30 @@ int main(int argc, char* argv[]) {
     std::cout << "[JACK] Client activated successfully" << std::endl;
     
     // ========================================================================
-    // MAIN LOOP - PROCESS MIDI EVENTS
+    // SETUP NON-BLOCKING KEYBOARD INPUT
+    // ========================================================================
+    setup_terminal();
+    
+    std::thread cmd_thread(command_thread_func);
+    cmd_thread.detach();
+    
+    // ========================================================================
+    // MAIN LOOP
     // ========================================================================
     std::cout << "\n========================================" << std::endl;
     std::cout << "Waiting for MIDI Clock messages..." << std::endl;
     std::cout << "Transport will auto-start on first clock" << std::endl;
-    std::cout << "Press Ctrl+C to exit" << std::endl;
-    std::cout << "Send SIGUSR1 for status: kill -USR1 " << getpid() << std::endl;
-    std::cout << "========================================\n" << std::endl;
+    std::cout << "\n╔════════════════════════════════════════╗" << std::endl;
+    std::cout << "║ Quick Commands (no Enter needed):     ║" << std::endl;
+    std::cout << "╠════════════════════════════════════════╣" << std::endl;
+    std::cout << "║ Press R       - Reset to beginning     ║" << std::endl;
+    std::cout << "║ Press S       - Show status            ║" << std::endl;
+    std::cout << "║ Press P/SPACE - Play/Pause toggle      ║" << std::endl;
+    std::cout << "║ Press H       - Help                   ║" << std::endl;
+    std::cout << "║ Press Q       - Quit                   ║" << std::endl;
+    std::cout << "║                                        ║" << std::endl;
+    std::cout << "║ Signal: kill -USR2 " << std::setw(5) << getpid() << " (reset)   ║" << std::endl;
+    std::cout << "╚════════════════════════════════════════╝\n" << std::endl;
     
     int npfds = snd_seq_poll_descriptors_count(g_seq_handle, POLLIN);
     struct pollfd pfds[npfds];
@@ -476,7 +607,6 @@ int main(int argc, char* argv[]) {
     snd_seq_event_t* ev = nullptr;
     
     while (g_running) {
-        // Poll for MIDI events with 100ms timeout
         if (poll(pfds, npfds, 100) > 0) {
             do {
                 if (snd_seq_event_input(g_seq_handle, &ev) >= 0) {
@@ -493,6 +623,8 @@ int main(int argc, char* argv[]) {
     // ========================================================================
     // CLEANUP
     // ========================================================================
+    restore_terminal();
+    
     std::cout << "\n[INFO] Cleaning up..." << std::endl;
     
     if (g_jack_client) {
@@ -506,5 +638,6 @@ int main(int argc, char* argv[]) {
     }
     
     std::cout << "[INFO] Shutdown complete\n" << std::endl;
+    
     return 0;
 }
