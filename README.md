@@ -178,3 +178,19 @@ Example:
 ║ Current Pos:     4:1:854               ║
 ╚════════════════════════════════════════╝
 
+
+
+```
+
+Carla Configuration Note
+
+For proper JACK transport syncing, ensure Carla’s config file contains:
+
+```
+nano ~/.config/falkTX/Carla2.conf
+```
+
+Set:
+```
+TransportMode=2
+```
