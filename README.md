@@ -178,8 +178,6 @@ Example:
 ║ Current Pos:     4:1:854               ║
 ╚════════════════════════════════════════╝
 
-
-
 ```
 
 Carla Configuration Note
@@ -194,3 +192,5 @@ Set:
 ```
 TransportMode=2
 ```
+
+Press “R” in the terminal → Resets the bar counter to 1
